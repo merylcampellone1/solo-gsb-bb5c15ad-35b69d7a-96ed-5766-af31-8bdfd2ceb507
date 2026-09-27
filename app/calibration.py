@@ -8,14 +8,14 @@ class CalibrationError(ValueError):
     """输入读数无法计算有效校准偏差时抛出。"""
 
 
-def _mean_same_sign(a: float, b: float) -> float:
-    """求两个同号（或其一为零）有限数的均值，且不发生上溢。
+def _mean_no_overflow(a: float, b: float) -> float:
+    """求两个有限数的均值，且中间步骤不发生上溢。
 
     a+b 有限时直接 (a+b)/2，结果与 statistics.median 的偶数组中点计算
     完全一致；a+b 会溢出（两数同号且幅值接近 float 上界）时改用
-    a/2 + b/2——两数同号时除以 2 后幅值减半，加法不再溢出。极大但
-    有限的同值读数（如两个 1e308）因此仍能得到 1e308，而不会被
-    (a+b)/2 误算成 ±Infinity。
+    a/2 + b/2——两数同号时除以 2 后幅值减半，加法不再溢出（异号时 a+b
+    本就有限，不会走到该分支）。极大但有限的同值输入（如两个 1e308）
+    因此仍能得到 1e308，而不会被 (a+b)/2 误算成 ±Infinity。
     """
     if math.isfinite(a + b):
         return (a + b) / 2.0
@@ -28,14 +28,14 @@ def finite_median(values: list[float]) -> float:
     statistics.median 对偶数个读数按 (a+b)/2 求中点；当 a、b 同为接近
     float 上界的有限数时 a+b 溢出为 Infinity，会把本应有限的中位数
     误算成 Infinity（进而把所有读数误判为异常）。此处仅在中点求和会
-    溢出时走 _mean_same_sign 的不溢出分支，其余情形与 statistics.median
+    溢出时走 _mean_no_overflow 的不溢出分支，其余情形与 statistics.median
     完全一致。
     """
     values = sorted(values)
     mid = len(values) // 2
     if len(values) % 2:
         return values[mid]
-    return _mean_same_sign(values[mid - 1], values[mid])
+    return _mean_no_overflow(values[mid - 1], values[mid])
 
 
 def split_outliers(readings: list[float], tolerance: float) -> tuple[float, list[float], list[float]]:
@@ -96,19 +96,36 @@ def interpolate(t: float, t0: float, b0: float, t1: float, b1: float) -> float:
 def integrate_segment(t0: float, b0: float, t1: float, b1: float) -> tuple[float, float]:
     """对线性段 (t0, b0)-(t1, b1) 下的面积做解析积分，返回 (signed, absolute)。
 
-    signed 为梯形面积 (b0+b1)/2·Δt。absolute 为 |bias| 的面积：端点严格异号时
-    段内恰有一个零点 t* = t0 − b0·Δt/(b1−b0)，在 t* 处拆成两个三角形求和
-    （面积为 (b0² + b1²)·Δt / (2·|b1−b0|)）；否则 |bias| 不变号，面积即 |signed|。
-    全程解析解，不做固定步长采样。
+    signed 为梯形面积 mean(b0, b1)·Δt：均值用 _mean_no_overflow 计算，
+    同号大值不会在 b0+b1 中途上溢（如 1e308→1e308 的一秒段面积仍为有限
+    的 1e308）。absolute 为 |bias| 的面积：端点严格异号时段内恰有一个零点，
+    按解析交点把段拆成两个三角形求和——交点的比例位置用缩放形式
+    (|b0|/m)/(|b0|/m+|b1|/m)（m = max(|b0|, |b1|)，各比值 ∈ [0,1]，分母
+    ∈ [1,2]，不溢出）定位，面积直接由 ½·|端点|·底边长 累加，不做 b0²+b1²
+    再除以 |b1−b0| 这类会先溢出为 ±Infinity、再 ∞/∞ 得 NaN 的中间运算
+    （如 1e308→−1e308 的两秒段面积为有限的 1e308）；否则 |bias| 不变号，
+    面积即 |signed|。全程解析解，不做固定步长采样。
+
+    端点偏差与时长均为有限值，但真实面积超出 float 上界（不可表示）时抛
+    CalibrationError——调用方据此返回 422，绝不把 NaN/Infinity 写进响应。
     """
     dt = t1 - t0
     if dt <= 0:
         return 0.0, 0.0
-    signed = (b0 + b1) * 0.5 * dt
-    if b0 * b1 < 0:  # 严格异号：段内恰有一个零点，按解析交点拆分
-        absolute = (b0 * b0 + b1 * b1) * 0.5 * dt / abs(b1 - b0)
+    signed = _mean_no_overflow(b0, b1) * dt
+    if (b0 < 0 < b1) or (b1 < 0 < b0):  # 严格异号：段内恰有一个零点，按解析交点拆分
+        a0, a1 = abs(b0), abs(b1)
+        m = max(a0, a1)  # 严格异号 => 两端均非零 => m > 0
+        w = (a0 / m) / (a0 / m + a1 / m)  # 零点在段内的比例位置，∈ (0, 1)
+        absolute = (a0 * 0.5) * (w * dt) + (a1 * 0.5) * ((1.0 - w) * dt)
     else:  # 同号或端点触零：不变号
         absolute = abs(signed)
+    if not (math.isfinite(signed) and math.isfinite(absolute)):
+        # 输入均有限，但真实面积超出 float 上界：不可表示，按输入不可处理拒绝（422）
+        raise CalibrationError(
+            "segment drift area overflows to a non-finite value "
+            "(bias magnitude and segment duration are too large)"
+        )
     return signed, absolute
 
 

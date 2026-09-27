@@ -497,7 +497,11 @@ def drift_integral(frm: float, to: float) -> dict:
 
     窗口边界可落在区间内部（按插值裁剪）；段内 bias 过零时按解析交点拆分
     绝对值面积。返回有符号/绝对值累计量与按时间排序的分段贡献，贡献之和
-    即汇总值（同一循环内累加，无二次求和误差）。
+    即汇总值（同一循环内累加，无二次求和误差）。有符号贡献按正、负分开
+    累加再合并（异号相加不会上溢），避免同号分段先溢出为 ±Infinity 再被
+    后续异号贡献抵消的中间上溢。各分段面积均有限、但真实累计量超出
+    float 上界（不可表示）时抛 CalibrationError（422），响应绝不包含
+    NaN/Infinity。
     """
     if not frm < to:
         raise InvalidWindowError(f"from ({frm}) must be less than to ({to})")
@@ -515,7 +519,8 @@ def drift_integral(frm: float, to: float) -> dict:
             (to, frm),
         ).fetchall()
         contributions = []
-        signed_total = 0.0
+        signed_pos = 0.0
+        signed_neg = 0.0
         absolute_total = 0.0
         for row in rows:
             a = max(frm, row["t_start"])   # 裁剪到查询窗口
@@ -525,7 +530,12 @@ def drift_integral(frm: float, to: float) -> dict:
             ba = calibration.interpolate(a, row["t_start"], row["bias_start"], row["t_end"], row["bias_end"])
             bb = calibration.interpolate(b, row["t_start"], row["bias_start"], row["t_end"], row["bias_end"])
             signed, absolute = calibration.integrate_segment(a, ba, b, bb)
-            signed_total += signed
+            # 正、负有符号贡献分开累加：各分项均有限，同号累加只在真实总量
+            # 不可表示时才会上溢；最后正负合并是异号相加，天然不溢出
+            if signed >= 0.0:
+                signed_pos += signed
+            else:
+                signed_neg += signed
             absolute_total += absolute
             contributions.append({
                 "t_start": a,
@@ -537,6 +547,14 @@ def drift_integral(frm: float, to: float) -> dict:
                 "signed_bias_seconds": signed,
                 "absolute_bias_seconds": absolute,
             })
+        signed_total = signed_pos + signed_neg
+        if not (math.isfinite(signed_total) and math.isfinite(absolute_total)):
+            # 各分段面积均有限，但真实累计量超出 float 上界：不可表示，
+            # 按输入不可处理拒绝（422），绝不输出 NaN/Infinity
+            raise CalibrationError(
+                "drift integral overflows to a non-finite value "
+                "(cumulative bias-seconds exceed the representable range)"
+            )
         return {
             "from": frm,
             "from_iso": epoch_to_iso(frm),

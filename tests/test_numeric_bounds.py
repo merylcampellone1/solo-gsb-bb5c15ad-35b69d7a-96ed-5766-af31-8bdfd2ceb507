@@ -595,3 +595,164 @@ def test_interpolate_midpoint_form_matches_linear_form_for_ordinary_values():
     # 极端异号端点：线性形式在差值处溢出（-inf），凸组合形式仍给出有限中点
     assert not math.isfinite(linear(1500.0, 1000.0, 1e308, 2000.0, -1e308))
     assert interpolate(1500.0, 1000.0, 1e308, 2000.0, -1e308) == 0.0
+
+
+# ---------- GET /drift-integral：极值积分 ----------
+
+@pytest.fixture()
+def extreme_integral_points(client):
+    """两条观测相距 2 秒，偏差分别为 +1e308 与 -1e308（段内在中点过零）。"""
+    big = 1e308
+    make_observation(client, ts=1000.0, reference=0.0, tolerance=0.0,
+                     readings=[-big, -big, -big])   # bias = 0 - (-1e308) = 1e308
+    make_observation(client, ts=1002.0, reference=0.0, tolerance=0.0,
+                     readings=[big, big, big])       # bias = 0 - 1e308 = -1e308
+    return client
+
+
+def test_drift_integral_opposite_extreme_biases_returns_finite_areas(extreme_integral_points):
+    # 1e308 → -1e308 的两秒区间：旧实现先平方再相除（∞/∞）得到 NaN，
+    # 现在按解析过零点拆成两个三角形：signed 0、absolute 1e308
+    resp = extreme_integral_points.get("/drift-integral",
+                                       params={"from": 1000.0, "to": 1002.0})
+    assert resp.status_code == 200, resp.text
+    # 响应必须是严格合法 JSON：不得包含 NaN/Infinity 令牌
+    assert "NaN" not in resp.text and "Infinity" not in resp.text
+    body = resp.json()
+    assert body["signed_bias_seconds"] == 0.0
+    assert body["absolute_bias_seconds"] == pytest.approx(1e308)
+    assert math.isfinite(body["signed_bias_seconds"])
+    assert math.isfinite(body["absolute_bias_seconds"])
+    # 分段贡献与汇总一致
+    contribs = body["contributions"]
+    assert len(contribs) == 1
+    assert contribs[0]["bias_start"] == pytest.approx(1e308)
+    assert contribs[0]["bias_end"] == pytest.approx(-1e308)
+    assert contribs[0]["signed_bias_seconds"] == 0.0
+    assert contribs[0]["absolute_bias_seconds"] == pytest.approx(1e308)
+    assert sum(c["signed_bias_seconds"] for c in contribs) == body["signed_bias_seconds"]
+    assert sum(c["absolute_bias_seconds"] for c in contribs) == body["absolute_bias_seconds"]
+
+
+def test_drift_integral_extreme_window_clipping_still_applies(extreme_integral_points):
+    # 窗口裁剪到区间前半段：bias 1e308 → 0（中点），三角形面积 0.5e308
+    resp = extreme_integral_points.get("/drift-integral",
+                                       params={"from": 1000.0, "to": 1001.0})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["signed_bias_seconds"] == pytest.approx(5e307)
+    assert body["absolute_bias_seconds"] == pytest.approx(5e307)
+
+
+def test_drift_integral_extreme_out_of_coverage_still_400(extreme_integral_points):
+    for params in ({"from": 999.0, "to": 1002.0}, {"from": 1000.0, "to": 1003.0}):
+        resp = extreme_integral_points.get("/drift-integral", params=params)
+        assert resp.status_code == 400
+        assert "outside calibration coverage" in resp.json()["detail"]
+
+
+def test_drift_integral_same_sign_extreme_biases_representable(client):
+    # 1e308 → 1e308 的一秒区间：真实面积 1e308 可表示，
+    # 旧实现 (b0+b1)/2 在求和处中途溢出为 Infinity
+    big = 1e308
+    make_observation(client, ts=1000.0, reference=0.0, tolerance=0.0,
+                     readings=[-big, -big, -big])
+    make_observation(client, ts=1001.0, reference=0.0, tolerance=0.0,
+                     readings=[-big, -big, -big])
+    resp = client.get("/drift-integral", params={"from": 1000.0, "to": 1001.0})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["signed_bias_seconds"] == pytest.approx(1e308)
+    assert body["absolute_bias_seconds"] == pytest.approx(1e308)
+
+
+def test_drift_integral_same_sign_extreme_biases_unrepresentable_422(client):
+    # 1e308 → 1e308 的两秒区间：真实面积 2e308 超出 float 上界 → 422
+    big = 1e308
+    make_observation(client, ts=1000.0, reference=0.0, tolerance=0.0,
+                     readings=[-big, -big, -big])
+    make_observation(client, ts=1002.0, reference=0.0, tolerance=0.0,
+                     readings=[-big, -big, -big])
+    resp = client.get("/drift-integral", params={"from": 1000.0, "to": 1002.0})
+    assert resp.status_code == 422
+    assert "overflows" in resp.json()["detail"]
+    assert "Infinity" not in resp.text
+
+
+def test_drift_integral_opposite_extreme_absolute_unrepresentable_422(client):
+    # 1e308 → -1e308 的四秒区间：signed 0 可表示，但绝对面积 2e308 不可表示 → 422
+    big = 1e308
+    make_observation(client, ts=1000.0, reference=0.0, tolerance=0.0,
+                     readings=[-big, -big, -big])
+    make_observation(client, ts=1004.0, reference=0.0, tolerance=0.0,
+                     readings=[big, big, big])
+    resp = client.get("/drift-integral", params={"from": 1000.0, "to": 1004.0})
+    assert resp.status_code == 422
+    assert "overflows" in resp.json()["detail"]
+
+
+def test_drift_integral_aggregate_overflow_422(client):
+    # 两段各 1e308 的同号面积：每段都可表示，累计 2e308 不可表示 → 422
+    big = 1e308
+    for ts in (1000.0, 1001.0, 1002.0):
+        make_observation(client, ts=ts, reference=0.0, tolerance=0.0,
+                         readings=[-big, -big, -big])
+    resp = client.get("/drift-integral", params={"from": 1000.0, "to": 1002.0})
+    assert resp.status_code == 422
+    assert "overflows" in resp.json()["detail"]
+    assert "Infinity" not in resp.text
+
+
+def test_drift_integral_multi_segment_extreme_aggregation_stays_finite(client):
+    # 三段异号交替（每段 1 秒过零）：各段 signed 0、absolute 5e307，
+    # 累计 signed 0、absolute 1.5e308，均可表示
+    big = 1e308
+    signs = [-big, big, -big, big]  # bias = 0 - reading：+big, -big, +big, -big
+    for ts, reading in zip((1000.0, 1001.0, 1002.0, 1003.0), signs):
+        make_observation(client, ts=ts, reference=0.0, tolerance=0.0,
+                         readings=[reading, reading, reading])
+    resp = client.get("/drift-integral", params={"from": 1000.0, "to": 1003.0})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["signed_bias_seconds"] == 0.0
+    assert body["absolute_bias_seconds"] == pytest.approx(1.5e308)
+    contribs = body["contributions"]
+    assert len(contribs) == 3
+    assert sum(c["signed_bias_seconds"] for c in contribs) == body["signed_bias_seconds"]
+    assert sum(c["absolute_bias_seconds"] for c in contribs) == body["absolute_bias_seconds"]
+
+
+# ---------- 纯函数单测：溢出安全的分段积分 ----------
+
+def test_integrate_segment_matches_trapezoid_for_ordinary_values():
+    from app.calibration import integrate_segment
+
+    # 同号梯形、异号过零拆分、端点触零的常规量级结果保持不变
+    assert integrate_segment(1000.0, 1.0, 2000.0, 3.0) == (2000.0, 2000.0)
+    assert integrate_segment(2000.0, 3.0, 3000.0, -1.0) == (1000.0, 1250.0)
+    assert integrate_segment(0.0, 0.0, 10.0, -4.0) == (-20.0, 20.0)
+    assert integrate_segment(0.0, -2.0, 10.0, 2.0) == (0.0, 10.0)
+    assert integrate_segment(1.0, 5.0, 1.0, -5.0) == (0.0, 0.0)  # 非正时长
+
+
+def test_integrate_segment_extreme_values_no_intermediate_overflow():
+    import math as m
+
+    from app.calibration import CalibrationError, integrate_segment
+
+    # 异号极值：按解析交点拆成两个三角形，面积为有限的 1e308（不再 ∞/∞ → NaN）
+    signed, absolute = integrate_segment(1000.0, 1e308, 1002.0, -1e308)
+    assert signed == 0.0
+    assert absolute == pytest.approx(1e308)
+    assert m.isfinite(absolute)
+
+    # 同号大值一秒段：真实面积 1e308 可表示，b0+b1 不再中途上溢
+    signed, absolute = integrate_segment(1000.0, 1e308, 1001.0, 1e308)
+    assert signed == pytest.approx(1e308)
+    assert absolute == pytest.approx(1e308)
+
+    # 真实面积不可表示（同号 2 秒、异号 4 秒）：抛 CalibrationError（→ 422）
+    with pytest.raises(CalibrationError):
+        integrate_segment(1000.0, 1e308, 1002.0, 1e308)
+    with pytest.raises(CalibrationError):
+        integrate_segment(1000.0, 1e308, 1004.0, -1e308)
