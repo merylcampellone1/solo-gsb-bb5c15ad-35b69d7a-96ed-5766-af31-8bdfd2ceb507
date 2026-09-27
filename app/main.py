@@ -274,11 +274,15 @@ def get_drift_integral(
 
     返回有符号/绝对值累计漂移量（偏差·秒）及按插值区间裁剪的分段贡献；
     窗口边界可落在区间内部，段内 bias 过零时按解析交点拆分绝对值面积。
+    解析积分与分段汇总均避免中间上溢；分段或汇总的真实面积超出 float
+    上界（不可表示）时返回 422，响应中不会出现 NaN/Infinity。
     """
     try:
         return service.drift_integral(frm=from_, to=to)
     except (InvalidWindowError, OutOfCoverageError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CalibrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/drift-exceedances", response_model=DriftExceedancesOut)

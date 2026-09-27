@@ -8,14 +8,14 @@ class CalibrationError(ValueError):
     """输入读数无法计算有效校准偏差时抛出。"""
 
 
-def _mean_same_sign(a: float, b: float) -> float:
-    """求两个同号（或其一为零）有限数的均值，且不发生上溢。
+def _mean_no_overflow(a: float, b: float) -> float:
+    """求两个有限数的均值，且不发生中间上溢。
 
     a+b 有限时直接 (a+b)/2，结果与 statistics.median 的偶数组中点计算
     完全一致；a+b 会溢出（两数同号且幅值接近 float 上界）时改用
-    a/2 + b/2——两数同号时除以 2 后幅值减半，加法不再溢出。极大但
-    有限的同值读数（如两个 1e308）因此仍能得到 1e308，而不会被
-    (a+b)/2 误算成 ±Infinity。
+    a/2 + b/2——两数同号时除以 2 后幅值减半，加法不再溢出（异号时 a+b
+    本就有限，不会走到该分支）。极大但有限的同值读数（如两个 1e308）
+    因此仍能得到 1e308，而不会被 (a+b)/2 误算成 ±Infinity。
     """
     if math.isfinite(a + b):
         return (a + b) / 2.0
@@ -28,14 +28,14 @@ def finite_median(values: list[float]) -> float:
     statistics.median 对偶数个读数按 (a+b)/2 求中点；当 a、b 同为接近
     float 上界的有限数时 a+b 溢出为 Infinity，会把本应有限的中位数
     误算成 Infinity（进而把所有读数误判为异常）。此处仅在中点求和会
-    溢出时走 _mean_same_sign 的不溢出分支，其余情形与 statistics.median
+    溢出时走 _mean_no_overflow 的不溢出分支，其余情形与 statistics.median
     完全一致。
     """
     values = sorted(values)
     mid = len(values) // 2
     if len(values) % 2:
         return values[mid]
-    return _mean_same_sign(values[mid - 1], values[mid])
+    return _mean_no_overflow(values[mid - 1], values[mid])
 
 
 def split_outliers(readings: list[float], tolerance: float) -> tuple[float, list[float], list[float]]:
@@ -96,17 +96,30 @@ def interpolate(t: float, t0: float, b0: float, t1: float, b1: float) -> float:
 def integrate_segment(t0: float, b0: float, t1: float, b1: float) -> tuple[float, float]:
     """对线性段 (t0, b0)-(t1, b1) 下的面积做解析积分，返回 (signed, absolute)。
 
-    signed 为梯形面积 (b0+b1)/2·Δt。absolute 为 |bias| 的面积：端点严格异号时
-    段内恰有一个零点 t* = t0 − b0·Δt/(b1−b0)，在 t* 处拆成两个三角形求和
-    （面积为 (b0² + b1²)·Δt / (2·|b1−b0|)）；否则 |bias| 不变号，面积即 |signed|。
-    全程解析解，不做固定步长采样。
+    signed 为梯形面积 mean(b0, b1)·Δt：均值按 _mean_no_overflow 的不溢出求法
+    计算——两端同为接近 float 上界的有限值时 (b0+b1) 会先溢出为 ±Infinity，
+    把本应有限的面积误算成 Infinity。absolute 为 |bias| 的面积：端点严格异号
+    时段内恰有一个零点，按解析交点拆成两个三角形分别求面积再相加——每个
+    三角形面积为 ½·|端点偏差|·底边（先算 ½·|b| 再乘底边），不做 b² 运算：
+    (b0²+b1²)·Δt/(2·|b1−b0|) 在 |b| 接近 float 上界时（如 1e308 → −1e308）
+    会先在平方处溢出为 Infinity，再除以 |b1−b0| 得到 NaN。过零点距 t0 的
+    时长占比按 |b0|/(|b0|+|b1|) 计算，|b0|+|b1| 会溢出时先把两者各自减半
+    再求比例（比值不变）。否则 |bias| 不变号，面积即 |signed|。
+    全程解析解，不做固定步长采样。真实面积超出 float 上界时对应返回值为
+    非有限数（±Infinity），由调用方按不可表示拒绝（不输出 NaN/Infinity）。
     """
     dt = t1 - t0
     if dt <= 0:
         return 0.0, 0.0
-    signed = (b0 + b1) * 0.5 * dt
-    if b0 * b1 < 0:  # 严格异号：段内恰有一个零点，按解析交点拆分
-        absolute = (b0 * b0 + b1 * b1) * 0.5 * dt / abs(b1 - b0)
+    signed = _mean_no_overflow(b0, b1) * dt
+    if (b0 < 0 < b1) or (b1 < 0 < b0):  # 严格异号：段内恰有一个零点，按解析交点拆分
+        h0, h1 = abs(b0), abs(b1)
+        if math.isfinite(h0 + h1):
+            frac = h0 / (h0 + h1)                # 零点距 t0 的时长占比 ∈ (0, 1)
+        else:  # |b0|+|b1| 溢出（均接近 float 上界）：各自减半再求比例，比值不变
+            frac = (h0 * 0.5) / (h0 * 0.5 + h1 * 0.5)
+        base0 = frac * dt                        # 过零点前半段的底边长
+        absolute = h0 * 0.5 * base0 + h1 * 0.5 * (dt - base0)
     else:  # 同号或端点触零：不变号
         absolute = abs(signed)
     return signed, absolute

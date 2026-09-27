@@ -492,12 +492,32 @@ def historical_correct(effective_at: float, as_of: float, reading: float) -> dic
 
 # ---------- 累计漂移量积分 ----------
 
+def _sum_without_intermediate_overflow(values: list[float]) -> float:
+    """对有限浮点列表求和，避免同号大值的部分和中间上溢。
+
+    逐项累加（以及 math.fsum）在同号大值先汇合时，中间部分和可能溢出为
+    ±Infinity——即使真实总和有限（如 +1e308、+1e308、−1e308、−1e308 逐项
+    抵消为 0，math.fsum 对此也会抛 OverflowError）。先按最大幅值缩放
+    （缩放后每项 |v| ≤ 1，部分和不超过项数，不可能溢出），用 math.fsum
+    精确求和后再乘回幅值；乘回溢出为 ±Infinity 时说明真实总和本身超出
+    float 上界，由调用方按不可表示拒绝。
+    """
+    if not values:
+        return 0.0
+    scale = max(abs(v) for v in values)
+    if scale == 0.0:
+        return 0.0
+    return math.fsum(v / scale for v in values) * scale
+
+
 def drift_integral(frm: float, to: float) -> dict:
     """对当前分段线性 bias 在窗口 [frm, to] 上做解析积分。
 
     窗口边界可落在区间内部（按插值裁剪）；段内 bias 过零时按解析交点拆分
-    绝对值面积。返回有符号/绝对值累计量与按时间排序的分段贡献，贡献之和
-    即汇总值（同一循环内累加，无二次求和误差）。
+    绝对值面积，不做固定步长采样。返回有符号/绝对值累计量与按时间排序的
+    分段贡献；汇总值由各分段面积按不溢出的缩放求和得到，与分段贡献一致。
+    分段面积或汇总值的真实结果超出 float 上界时抛 CalibrationError（422），
+    响应中绝不出现 NaN/Infinity。
     """
     if not frm < to:
         raise InvalidWindowError(f"from ({frm}) must be less than to ({to})")
@@ -515,8 +535,8 @@ def drift_integral(frm: float, to: float) -> dict:
             (to, frm),
         ).fetchall()
         contributions = []
-        signed_total = 0.0
-        absolute_total = 0.0
+        signed_parts: list[float] = []
+        absolute_parts: list[float] = []
         for row in rows:
             a = max(frm, row["t_start"])   # 裁剪到查询窗口
             b = min(to, row["t_end"])
@@ -525,8 +545,15 @@ def drift_integral(frm: float, to: float) -> dict:
             ba = calibration.interpolate(a, row["t_start"], row["bias_start"], row["t_end"], row["bias_end"])
             bb = calibration.interpolate(b, row["t_start"], row["bias_start"], row["t_end"], row["bias_end"])
             signed, absolute = calibration.integrate_segment(a, ba, b, bb)
-            signed_total += signed
-            absolute_total += absolute
+            if not (math.isfinite(signed) and math.isfinite(absolute)):
+                # 该分段的真实面积超出 float 上界：结果不可表示，拒绝（422），
+                # 绝不让 NaN/Infinity 进入响应
+                raise CalibrationError(
+                    "drift integral overflows to a non-finite value "
+                    "(segment area exceeds the finite float range)"
+                )
+            signed_parts.append(signed)
+            absolute_parts.append(absolute)
             contributions.append({
                 "t_start": a,
                 "t_end": b,
@@ -537,6 +564,14 @@ def drift_integral(frm: float, to: float) -> dict:
                 "signed_bias_seconds": signed,
                 "absolute_bias_seconds": absolute,
             })
+        signed_total = _sum_without_intermediate_overflow(signed_parts)
+        absolute_total = _sum_without_intermediate_overflow(absolute_parts)
+        if not (math.isfinite(signed_total) and math.isfinite(absolute_total)):
+            # 各分段面积有限但真实总面积超出 float 上界：同样不可表示，拒绝（422）
+            raise CalibrationError(
+                "drift integral overflows to a non-finite value "
+                "(total area exceeds the finite float range)"
+            )
         return {
             "from": frm,
             "from_iso": epoch_to_iso(frm),
